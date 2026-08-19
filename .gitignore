@@ -1,0 +1,16 @@
+# Environment secrets - never commit real aGate IPs/credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+franklinwh_local_api.egg-info/
+.eggs/
+build/
+dist/
+venv/
+.venv/
+
+# Test artifacts
+.pytest_cache/
