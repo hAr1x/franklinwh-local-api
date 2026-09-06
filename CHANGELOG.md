@@ -27,6 +27,17 @@ file. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.
   still run the full standard M704 sequence (releasing anything active
   first).
 
+### Fixed
+
+- Watchdog auto-release now completes reliably: the fire path called
+  `async_stop_battery_command()`, which disarmed the watchdog -
+  cancelling the very task that was performing the release and aborting
+  the release sequence's first register write. `disarm_watchdog()` no
+  longer cancels the currently-running task, and a failed auto-release
+  is now logged instead of leaving an un-retrieved task exception.
+  (Discovered during 0.1.1 hardware testing; in 0.1.0 the watchdog
+  could fire but abort the release mid-sequence.)
+
 ## [0.1.0] - Initial release
 
 ### Added
