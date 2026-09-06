@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "franklinwh_local_api"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fully local (LAN-only) async Python client for the FranklinWH aGate over Modbus TCP"
 readme = "README.md"
 license = "GPL-3.0-or-later"

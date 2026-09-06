@@ -6,7 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  linting:
+    name: Code Linting (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Run Ruff
+        run: ruff check franklinwh_local_api/
+
   publish:
+    needs: [linting]
     runs-on: ubuntu-latest
     permissions:
       id-token: write

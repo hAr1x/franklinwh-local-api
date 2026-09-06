@@ -26,7 +26,6 @@ needing executor-thread wrapping.
 
 import asyncio
 import logging
-from typing import List, Optional
 
 from pymodbus.client import AsyncModbusTcpClient
 
@@ -59,7 +58,7 @@ def _apply_scale(raw: int, scale_factor: int) -> float:
     return raw * (10 ** scale_factor)
 
 
-def _decode_sunspec_string(registers: List[int]) -> str:
+def _decode_sunspec_string(registers: list[int]) -> str:
     """Decode a SunSpec-style string field: a sequence of uint16
     registers, each holding 2 ASCII characters big-endian (high byte
     first), null-padded to the field's fixed length. Strips trailing
@@ -105,7 +104,7 @@ class FranklinWHLocalClient:
         self._unit_id = unit_id
         self._timeout = timeout
 
-        self._client: Optional[AsyncModbusTcpClient] = None
+        self._client: AsyncModbusTcpClient | None = None
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -132,7 +131,9 @@ class FranklinWHLocalClient:
             self._client.close()
             self._client = None
 
-    async def __aenter__(self) -> "FranklinWHLocalClient":
+    # typing.Self would be the modern annotation, but this package
+    # still supports Python 3.10 (requires-python = ">=3.10").
+    async def __aenter__(self) -> "FranklinWHLocalClient":  # noqa: PYI034
         await self.connect()
         return self
 
@@ -147,7 +148,7 @@ class FranklinWHLocalClient:
     # Low-level register helpers
     # ------------------------------------------------------------------
 
-    async def _read_registers(self, address: int, count: int) -> List[int]:
+    async def _read_registers(self, address: int, count: int) -> list[int]:
         """Read `count` holding registers starting at `address`.
 
         Raises FranklinWHConnectionError on any Modbus-level failure.
@@ -290,8 +291,8 @@ class FranklinWHLocalClient:
         self_reserve_pct = ext[const.EXT_OFF_SELF_RESERVE]
         tou_reserve_pct = ext[const.EXT_OFF_TOU_RESERVE]
 
-        tou_dispatch_state: Optional[str] = None
-        tou_dispatch_raw: Optional[int] = None
+        tou_dispatch_state: str | None = None
+        tou_dispatch_raw: int | None = None
         if operating_mode == OperatingMode.TOU:
             tou_dispatch_raw = ext[const.EXT_OFF_TOU_DISPATCH]
             tou_dispatch_state = const.TOU_DISPATCH_MAP.get(
@@ -457,33 +458,130 @@ class FranklinWHLocalClient:
     # Battery command (M704 manual battery charge/discharge control)
     # ------------------------------------------------------------------
 
+    async def async_get_battery_limits(self) -> tuple:
+        """Read SunSpec M702 once and return (charge_max_w, discharge_max_w).
+
+        Both nameplate ratings are cached internally as a side effect,
+        so later WSetPct conversions and status decoding reuse them. This
+        is meant to be called once at integration init time - the caller
+        (e.g. the Home Assistant integration) decides how to fall back
+        if the read fails.
+
+        Raises:
+            FranklinWHConnectionError: on any Modbus-level read failure.
+        """
+        await self._read_charge_rate_max_w()  # reads M702 once, caches both
+        return (
+            self._get_charge_rate_max_w_cached(),
+            self._get_discharge_rate_max_w_cached(),
+        )
+
+    def arm_watchdog(self, duration_s: float) -> None:
+        """Arm the software auto-release watchdog for `duration_s` seconds.
+
+        The watchdog is a plain in-process asyncio timer: when it fires,
+        the active M704 battery command is released. It has no notion of
+        an absolute deadline - clients that need to re-arm after a
+        restart (e.g. the Home Assistant integration) are responsible
+        for computing the remaining seconds and calling this again.
+        Re-arming replaces any previously armed watchdog.
+        """
+        if duration_s <= 0:
+            raise ValueError(f"duration_s must be positive, got {duration_s}")
+        self.disarm_watchdog()
+        loop = asyncio.get_running_loop()
+        self._watchdog_task = loop.create_task(self._watchdog_fire(duration_s))
+
+    def disarm_watchdog(self) -> None:
+        """Cancel any armed software auto-release watchdog."""
+        task = getattr(self, "_watchdog_task", None)
+        if (
+            task is not None
+            and not task.done()
+            # Never cancel the task we are running inside of: the watchdog
+            # fire path calls async_stop_battery_command() which disarms
+            # the watchdog, and cancelling ourselves would inject a
+            # CancelledError into the release sequence mid-flight.
+            and task is not asyncio.current_task()
+        ):
+            task.cancel()
+        self._watchdog_task = None
+
     async def async_start_battery_charge(
-        self, power_w: float, duration_s: Optional[float] = None
+        self, power_w: float, duration_s: float | None = None
     ) -> None:
-        """Command the battery to charge at the given power via M704."""
+        """Command the battery to charge at the given power via M704.
+
+        If a charge command is already active, the setpoint is rewritten
+        in place (a single WSetPct register write, no disable/enable
+        cycle) - this is the live power-adjustment fast path. If no
+        command (or the opposite direction) is active, the full standard
+        sequence runs, releasing anything active first.
+
+        The watchdog is left untouched on the fast path unless a new
+        `duration_s` is explicitly given (changing power does not by
+        itself reset the auto-release countdown).
+        """
         if power_w <= 0:
             raise ValueError(f"power_w must be positive, got {power_w}")
 
         max_w = await self._read_charge_rate_max_w()
         pct = min(power_w / max_w * 100.0, 100.0) if max_w > 0 else 0.0
+
+        cmd = await self.async_get_battery_command_status()
+        if cmd["wset_ena"] and cmd["wset_pct"] < 0:
+            # Charge already active: rewrite WSetPct directly.
+            await self._rewrite_wsetpct(-pct)
+            if duration_s is not None and duration_s > 0:
+                self.arm_watchdog(duration_s)
+            _LOGGER.info(
+                "Battery charge setpoint updated in place: %.0fW "
+                "(%.1f%% of %.0fW rating)", power_w, pct, max_w
+            )
+            return
+
         await self._send_wsetpct_command(-pct)
-        self._arm_watchdog(duration_s)
+        self._arm_watchdog_optional(duration_s)
         _LOGGER.info(
             "Battery charge command sent: %.0fW (%.1f%% of %.0fW rating)",
             power_w, pct, max_w
         )
 
     async def async_start_battery_discharge(
-        self, power_w: float, duration_s: Optional[float] = None
+        self, power_w: float, duration_s: float | None = None
     ) -> None:
-        """Command the battery to discharge at the given power via M704."""
+        """Command the battery to discharge at the given power via M704.
+
+        If a discharge command is already active, the setpoint is
+        rewritten in place (a single WSetPct register write, no
+        disable/enable cycle) - this is the live power-adjustment fast
+        path. If no command (or the opposite direction) is active, the
+        full standard sequence runs, releasing anything active first.
+
+        The watchdog is left untouched on the fast path unless a new
+        `duration_s` is explicitly given (changing power does not by
+        itself reset the auto-release countdown).
+        """
         if power_w <= 0:
             raise ValueError(f"power_w must be positive, got {power_w}")
 
         max_w = await self._read_discharge_rate_max_w()
         pct = min(power_w / max_w * 100.0, 100.0) if max_w > 0 else 0.0
+
+        cmd = await self.async_get_battery_command_status()
+        if cmd["wset_ena"] and cmd["wset_pct"] > 0:
+            # Discharge already active: rewrite WSetPct directly.
+            await self._rewrite_wsetpct(pct)
+            if duration_s is not None and duration_s > 0:
+                self.arm_watchdog(duration_s)
+            _LOGGER.info(
+                "Battery discharge setpoint updated in place: %.0fW "
+                "(%.1f%% of %.0fW rating)", power_w, pct, max_w
+            )
+            return
+
         await self._send_wsetpct_command(pct)
-        self._arm_watchdog(duration_s)
+        self._arm_watchdog_optional(duration_s)
         _LOGGER.info(
             "Battery discharge command sent: %.0fW (%.1f%% of %.0fW rating)",
             power_w, pct, max_w
@@ -491,7 +589,7 @@ class FranklinWHLocalClient:
 
     async def async_stop_battery_command(self, handshake_wait_s: float = 1.0) -> None:
         """Release the active M704 command and restore native mode scheduling."""
-        self._cancel_watchdog()
+        self.disarm_watchdog()
 
         await self._write_register(const.M704_ADDR_WSETMOD, const.WSETMOD_PERCENT)
         await self._write_register(const.M704_ADDR_WSETPCT, 0)
@@ -520,11 +618,33 @@ class FranklinWHLocalClient:
 
     # --- Internal helpers for battery command ---
 
+    async def _rewrite_wsetpct(self, pct: float) -> None:
+        """Rewrite WSetPct in place while WSetEna=1 (live power change).
+
+        Single-register write + read-back verification; the hardware
+        accepts the new setpoint without a disable/enable cycle (verified
+        on reference hardware, to be re-verified on the target aGate).
+        """
+        sf_raw = await self._read_and_verify_register(const.M704_ADDR_WSETPCT_SF)
+        sf = _to_signed16(sf_raw)
+        pct_raw = round(pct / (10 ** sf))
+
+        await self._write_register(const.M704_ADDR_WSETPCT, _to_unsigned16(pct_raw))
+
+        actual_pct_raw = _to_signed16(
+            await self._read_and_verify_register(const.M704_ADDR_WSETPCT)
+        )
+        if actual_pct_raw != pct_raw:
+            raise FranklinWHWriteError(
+                f"Live WSetPct rewrite was not accepted by hardware "
+                f"(register reads {actual_pct_raw}, expected {pct_raw})."
+            )
+
     async def _send_wsetpct_command(self, pct: float) -> None:
         """Execute the standard SunSpec 4-phase M704 command sequence."""
         sf_raw = await self._read_and_verify_register(const.M704_ADDR_WSETPCT_SF)
         sf = _to_signed16(sf_raw)
-        pct_raw = int(round(pct / (10 ** sf)))
+        pct_raw = round(pct / (10 ** sf))
 
         await self._write_register(const.M704_ADDR_WSETENA, const.WSETENA_DISABLED)
         await asyncio.sleep(0.1)
@@ -578,26 +698,31 @@ class FranklinWHLocalClient:
         """See _get_charge_rate_max_w_cached()."""
         return getattr(self, "_cached_discharge_rate_max_w", 5000.0)
 
-    def _arm_watchdog(self, duration_s: Optional[float]) -> None:
-        """Start (or replace) the software auto-release watchdog timer."""
-        self._cancel_watchdog()
+    def _arm_watchdog_optional(self, duration_s: float | None) -> None:
+        """0.1.0-compatible arming used by the start command paths:
+        positive duration arms the watchdog, anything else disarms it.
+        """
         if duration_s is not None and duration_s > 0:
-            loop = asyncio.get_event_loop()
-            self._watchdog_task = loop.create_task(self._watchdog_fire(duration_s))
-
-    def _cancel_watchdog(self) -> None:
-        task = getattr(self, "_watchdog_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-        self._watchdog_task = None
+            self.arm_watchdog(duration_s)
+        else:
+            self.disarm_watchdog()
 
     async def _watchdog_fire(self, duration_s: float) -> None:
+        # If the watchdog is disarmed while sleeping, the CancelledError
+        # propagates and ends this task - that is the intended behavior.
+        await asyncio.sleep(duration_s)
+        _LOGGER.warning(
+            "Battery command watchdog timeout (%.0fs) reached - auto-releasing",
+            duration_s
+        )
         try:
-            await asyncio.sleep(duration_s)
-            _LOGGER.warning(
-                "Battery command watchdog timeout (%.0fs) reached - auto-releasing",
-                duration_s
-            )
             await self.async_stop_battery_command()
-        except asyncio.CancelledError:
-            pass
+        except FranklinWHConnectionError as e:
+            # Log but do not let a failed release leave an un-retrieved
+            # task exception; the command may still be active on the
+            # hardware side, which the client can detect on its next
+            # status read.
+            _LOGGER.error(
+                "Battery command watchdog auto-release FAILED: %s",
+                e
+            )

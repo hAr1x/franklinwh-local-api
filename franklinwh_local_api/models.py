@@ -28,7 +28,6 @@ Contains:
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
 
 
 class OperatingMode(Enum):
@@ -127,13 +126,13 @@ class FranklinWHStatus:
     operating_mode: OperatingMode
     self_reserve_pct: int
     tou_reserve_pct: int
-    tou_dispatch_state: Optional[str] = None
-    tou_dispatch_raw: Optional[int] = None
+    tou_dispatch_state: str | None = None
+    tou_dispatch_raw: int | None = None
 
     ambient_temp_c: float = 0.0
     cabinet_temp_c: float = 0.0
 
-    alarms: List[str] = field(default_factory=list)
+    alarms: list[str] = field(default_factory=list)
     alarm_active: bool = False
     raw_alarm_bits: int = 0
 

@@ -34,21 +34,21 @@ Public API:
 """
 
 from .client import FranklinWHLocalClient
-from .models import FranklinWHDeviceInfo, FranklinWHStatus, OperatingMode
 from .exceptions import (
-    FranklinWHLocalApiError,
     FranklinWHConnectionError,
+    FranklinWHLocalApiError,
     FranklinWHWriteError,
 )
+from .models import FranklinWHDeviceInfo, FranklinWHStatus, OperatingMode
 
 __all__ = [
+    "FranklinWHConnectionError",
+    "FranklinWHDeviceInfo",
+    "FranklinWHLocalApiError",
     "FranklinWHLocalClient",
     "FranklinWHStatus",
-    "FranklinWHDeviceInfo",
-    "OperatingMode",
-    "FranklinWHLocalApiError",
-    "FranklinWHConnectionError",
     "FranklinWHWriteError",
+    "OperatingMode",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
